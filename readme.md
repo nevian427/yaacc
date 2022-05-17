@@ -12,4 +12,4 @@
     FailCDRFile string `toml:"failcdr" env:"YAACC_FAILCDR"`
     
 #### Expected CDR format 114 bytes long
-![avaya custom format CDR](Screenshot 2021-07-23 at 16.57.52.png)
+![avaya custom format CDR](avaya_custom_format.png)
