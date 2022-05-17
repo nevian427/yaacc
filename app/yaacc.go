@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,6 +23,11 @@ import (
 	"github.com/oklog/run"
 	jww "github.com/spf13/jwalterweatherman"
 	"github.com/spf13/pflag"
+)
+
+var (
+	ErrDBConnFail    = errors.New("DB connection failed:")
+	ErrDBCreateTable = errors.New("Creation CDR table failed:")
 )
 
 type Config struct {
@@ -55,24 +61,16 @@ type CDR struct {
 	outTrkS    int
 }
 
-var (
-	cfg       Config
-	dbCh      chan CDR
-	metricsCh chan CDR
-	inputCh   chan string
-)
-
 // Создаём новое соединение с БД
-func connectToDB() *pgxpool.Pool {
-	pool, err := pgxpool.Connect(context.Background(), fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=disable", cfg.DBHost, cfg.DBPort, cfg.DBName, cfg.DBUser, cfg.DBPassword))
+func connectToDB(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
+	pool, err := pgxpool.Connect(ctx, fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=disable", cfg.DBHost, cfg.DBPort, cfg.DBName, cfg.DBUser, cfg.DBPassword))
 	if err != nil {
 		// без БД делать нам нечего - аварийно выходим
-		jww.ERROR.Fatalf("DB connection failed: %s", err)
-		return nil
+		return nil, fmt.Errorf("%w err: %s", ErrDBConnFail, err)
 	}
 
 	// Пытаемся создать таблицу для сохранения информации
-	_, err = pool.Exec(context.Background(), `CREATE TABLE IF NOT EXISTS avaya_cdr
+	_, err = pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS avaya_cdr
 		(
 			id serial primary key,
 			host varchar(15) not null,
@@ -98,34 +96,35 @@ func connectToDB() *pgxpool.Pool {
 		CREATE INDEX IF NOT EXISTS avaya_cdr_vdn_idx ON public.avaya_cdr USING btree (vdn);`)
 
 	if err != nil {
-		jww.ERROR.Fatalf("Creation CDR table failed: %s", err)
-		return nil
+		return nil, fmt.Errorf("%w err: %s", ErrDBCreateTable, err)
 	}
 
 	jww.INFO.Println("Started DB pool")
-	return pool
+	return pool, nil
 }
 
 // Вставка разобраной строки из структуры в БД
-func insertDB(pool *pgxpool.Pool) error {
+func insertDB(ctx context.Context, pool *pgxpool.Pool, dbCh <-chan CDR) error {
 	defer func() {
 		// заглушка, реальное закрытие в майне
-		jww.INFO.Println("closing DB connection")
+		jww.INFO.Println("Shutdown insertDB worker")
 	}()
 
 	for {
-		cdr, ok := <-dbCh
-		// канал закрыт делать больше нечего
-		if !ok {
-			return nil
-		}
-
-		// Exec сам возвращает соединение в пул
-		commandTag, err := pool.Exec(context.Background(), "insert into avaya_cdr (host, datetime, duration, cond_code, code_dial, code_used, dst_num, src_num, acct_code, ppm, in_trunk_ts, out_trunk_ts, in_trunk, vdn, feat_flag) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)", cdr.ip, cdr.timestamp, cdr.duration, cdr.condCode, cdr.codeDial, cdr.codeUsed, cdr.dialedNum, cdr.callingNum, cdr.acctCode, cdr.ppm, cdr.inTrkS, cdr.outTrkS, cdr.inTrk, cdr.vdn, cdr.featFlag)
-		if err != nil {
-			jww.ERROR.Printf("CDR not inserted: %s", err)
-		} else {
-			if commandTag.RowsAffected() != 1 {
+		select {
+		// сигнал на выход
+		case <-ctx.Done():
+			return ctx.Err()
+		case cdr, ok := <-dbCh:
+			// канал закрыт делать больше нечего
+			if !ok {
+				return nil
+			}
+			// Exec сам возвращает соединение в пул
+			commandTag, err := pool.Exec(ctx, "insert into avaya_cdr (host, datetime, duration, cond_code, code_dial, code_used, dst_num, src_num, acct_code, ppm, in_trunk_ts, out_trunk_ts, in_trunk, vdn, feat_flag) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)", cdr.ip, cdr.timestamp, cdr.duration, cdr.condCode, cdr.codeDial, cdr.codeUsed, cdr.dialedNum, cdr.callingNum, cdr.acctCode, cdr.ppm, cdr.inTrkS, cdr.outTrkS, cdr.inTrk, cdr.vdn, cdr.featFlag)
+			if err != nil {
+				jww.ERROR.Printf("CDR not inserted: %s", err)
+			} else if commandTag.RowsAffected() != 1 {
 				jww.ERROR.Println("CDR not inserted for unknown reason")
 			}
 		}
@@ -133,7 +132,7 @@ func insertDB(pool *pgxpool.Pool) error {
 }
 
 // собираем метрики во время работы
-func metricsCDR() error {
+func metricsCDR(metricsCh <-chan CDR) error {
 	for {
 		cdr, ok := <-metricsCh
 		// канал закрыт делать больше нечего
@@ -158,6 +157,7 @@ func metricsCDR() error {
 
 // основная задача - разобрать чего же нам прислала телефонная станция
 func decodeCDR(r string) (CDR, error) {
+	// Нам нужен экземпляр структуры для правильного присвоения полей + ошибка
 	var (
 		cdr CDR
 		err error
@@ -170,8 +170,17 @@ func decodeCDR(r string) (CDR, error) {
 
 	loc, _ := time.LoadLocation("Local")
 
+	// Заполняем длительность первой - она нам понадобится при вычислении старта звонка
 	cdr.duration, err = strconv.Atoi(r[12:17])
+	if err != nil {
+		return CDR{}, err
+	}
+	// Приводим авайский формат даты/времени окончания вызова к стандартному времени
 	cdr.timestamp, err = time.ParseInLocation("020106 1504", r[0:11], loc)
+	if err != nil {
+		return CDR{}, err
+	}
+	// Вычисляем реальное время начала вызова
 	cdr.timestamp = cdr.timestamp.Add(-time.Second * time.Duration(cdr.duration))
 	cdr.condCode = string(r[18])
 	cdr.codeDial = strings.TrimLeft(r[20:24], " ")
@@ -186,19 +195,16 @@ func decodeCDR(r string) (CDR, error) {
 	cdr.inTrk = strings.TrimLeft(r[100:104], " ")
 	cdr.vdn = strings.TrimLeft(r[105:112], " ")
 	cdr.featFlag = string(r[113])
-	if err != nil {
-		return CDR{}, err
-	}
 
 	return cdr, nil
 }
 
 // приёмник данных от станции
-func serveCDR(ctx context.Context) error {
+func serveCDR(ctx context.Context, inputCh chan<- string, dbCh chan CDR, CDRAddr string) (ErrCDR error) {
 	var wg sync.WaitGroup
 
 	// пытаемся понять куда цепляться
-	ta, err := net.ResolveTCPAddr("tcp", cfg.CDRAddr)
+	ta, err := net.ResolveTCPAddr("tcp", CDRAddr)
 	if err != nil {
 		// возвращаем ошибку и раннер потушит остальное ибо бессмысленно продолжать
 		return err
@@ -212,10 +218,14 @@ func serveCDR(ctx context.Context) error {
 	}
 	jww.INFO.Printf("Started CDR listener on %s", ln.Addr())
 
-	defer func() error {
+	defer func() {
 		err := ln.Close()
 		if err != nil {
-			return err
+			if ErrCDR != nil {
+				ErrCDR = fmt.Errorf("%w Can't close connection: %s", ErrCDR, err.Error())
+			}
+			ErrCDR = err
+			return
 		}
 
 		wg.Wait()
@@ -223,7 +233,7 @@ func serveCDR(ctx context.Context) error {
 		// закрываем каналы воркеров и БД для из завершения
 		close(inputCh)
 		close(dbCh)
-		return nil
+		return
 	}()
 
 	for {
@@ -283,7 +293,7 @@ func serveCDR(ctx context.Context) error {
 }
 
 // рабочие лошадки
-func workerCDR() error {
+func workerCDR(inputCh <-chan string, dbCh, metricsCh chan<- CDR) error {
 	for {
 		data, ok := <-inputCh
 		// канал закрыт - на выход
@@ -297,7 +307,6 @@ func workerCDR() error {
 		if err != nil {
 			// выводим плохую строчку в лог
 			jww.WARN.Printf("Error %s while parsing cdr\n\"%s\"", err, data[strings.Index(data, "|")+1:])
-			err = nil
 			// увеличиваем счётчик ошибок для конкретного источника
 			metrics.GetOrCreateCounter("yaacc_cdr_err_count{source=\"" + data[:strings.Index(data, "|")] + "\"}").Add(1)
 
@@ -321,10 +330,10 @@ func workerCDR() error {
 }
 
 // публикация метрик
-func serveMetrics(ctx context.Context) error {
+func serveMetrics(ctx context.Context, MetricsAddr string) error {
 	// создаём структуру сервера только для возможности последующего Shutdown
 	srv := &http.Server{
-		Addr: cfg.MetricsAddr,
+		Addr: MetricsAddr,
 	}
 
 	// стандартный заголовок кодировки, но нужен ли он?
@@ -335,11 +344,10 @@ func serveMetrics(ctx context.Context) error {
 
 	// Пытаемся слушать порт, но если не получилось - проживём без метрик
 	go func() {
+		jww.INFO.Printf("Starting metrics server on %s", MetricsAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			jww.WARN.Printf("Metrics listen err:%+s\n", err)
-			return nil
 		}
-		jww.INFO.Printf("Metrics server started on %s", cfg.MetricsAddr)
 	}()
 
 	// ждём сигнала завершения
@@ -363,15 +371,18 @@ func serveMetrics(ctx context.Context) error {
 }
 
 func main() {
-	var g run.Group
+	var (
+		g   run.Group
+		cfg Config
+	)
 	// открываем каналы для работы
 	// почему буфер 5 - уже не помню, какая-то эвристика..
 	// запись в БД (из обработчика)
-	dbCh = make(chan CDR, 5)
+	dbCh := make(chan CDR, 5)
 	// в метрики
-	metricsCh = make(chan CDR, 5)
+	metricsCh := make(chan CDR, 5)
 	// в обработчик
-	inputCh = make(chan string, 5)
+	inputCh := make(chan string, 5)
 
 	// парсим флаги - нас интересуют только лог и конфиг
 	cfgfile := pflag.StringP("config", "c", "./yaacc.toml", "File to read config params from")
@@ -409,29 +420,34 @@ func main() {
 
 	// spew.Dump(cfg)
 
-	// инициализация пула соединений с БД
-	pool := connectToDB()
-
 	// основной контекст для работы - он может закрыть всё
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// инициализация пула соединений с БД
+	pool, err := connectToDB(ctx, cfg)
+	if err != nil {
+		jww.WARN.Fatal(err)
+	}
 
 	// запускаем минимум по 4 копии
 	nc := runtime.NumCPU()
 	if nc < 4 {
 		nc = 4
 	}
+
+	jww.INFO.Printf("Starting %d DB and CDR workers", nc)
 	for n := 0; n < nc; n++ {
 		// БД
-		g.Add(func() error { return insertDB(pool) }, func(err error) {})
+		g.Add(func() error { return insertDB(ctx, pool, dbCh) }, func(err error) {})
 		// обработчик
-		g.Add(func() error { return workerCDR() }, func(err error) {})
+		g.Add(func() error { return workerCDR(inputCh, dbCh, metricsCh) }, func(err error) {})
 	}
 	// обработчик метрик, на выходе закрыввем канал
-	g.Add(func() error { return metricsCDR() }, func(err error) { close(metricsCh) })
+	g.Add(func() error { return metricsCDR(metricsCh) }, func(err error) { close(metricsCh) })
 	// приёмник CDR с отменой контекста по ошибке
-	g.Add(func() error { return serveCDR(ctx) }, func(err error) { cancel() })
+	g.Add(func() error { return serveCDR(ctx, inputCh, dbCh, cfg.CDRAddr) }, func(err error) { cancel() })
 	// публикация метрик с отменой контекста по ошибке
-	g.Add(func() error { return serveMetrics(ctx) }, func(err error) { cancel() })
+	g.Add(func() error { return serveMetrics(ctx, cfg.MetricsAddr) }, func(err error) { cancel() })
 	// перехват сигналов ОС с отменой контекста
 	g.Add(run.SignalHandler(ctx, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL))
 	// запускаем всё, при ошибке в любой компоненте - выход

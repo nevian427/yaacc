@@ -1,14 +1,18 @@
-# CDR receiver
+# CDR receiver default ":5013"
 #CDRAddr = "localhost:5013"
-# Metrics publisher
+# Metrics publisher default ":9013"
 #Metrics = "localhost:9013"
-# Host PostgreSQL on
+# Host PostgreSQL on default "localhost"
 DBHost = "10.0.64.104"
-# PgSQL port
+# PgSQL port default "5432"
 #DBPort = 5432
-# PgSQL database name
+# PgSQL database name default "postgres"
 DBName = "cdrs"
-# PgSQL Auth user
+# PgSQL Auth user default "cdrs"
 DBUser = "cdrs"
-# PgSQL Auth password
+# PgSQL Auth password no default
 DBPassword = "freeswitch"
+# Logfile if empty defult to StdOut
+#LogFile = ./yaacc.log
+# Write failled CDR to (not implemented)
+#FailCDR = cdr_failed.txt
