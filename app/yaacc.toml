@@ -1,0 +1,14 @@
+# CDR receiver
+#CDRAddr = "localhost:5013"
+# Metrics publisher
+#Metrics = "localhost:9013"
+# Host PostgreSQL on
+DBHost = "10.0.64.104"
+# PgSQL port
+#DBPort = 5432
+# PgSQL database name
+DBName = "cdrs"
+# PgSQL Auth user
+DBUser = "cdrs"
+# PgSQL Auth password
+DBPassword = "freeswitch"
